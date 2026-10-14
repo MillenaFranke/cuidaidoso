@@ -1,0 +1,162 @@
+name: CI/CD CuidaIdoso
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    name: Build e testes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build e testes automatizados
+        run: mvn -B verify
+
+      - name: Guardar relatórios de teste
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorios-de-teste
+          path: target/surefire-reports/
+
+  docker-image:
+    name: Imagem Docker
+    needs: build-and-test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Definir nome da imagem em minúsculas
+        id: meta
+        run: |
+          IMG=$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${IMG}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest=${IMG}:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy em staging
+    needs: docker-image
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copiar compose para o servidor
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: docker-compose.yml
+          target: ~/cuidaidoso/staging
+
+      - name: Subir nova versão
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ~/cuidaidoso/staging
+            export APP_IMAGE=${{ needs.docker-image.outputs.image }}
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose --env-file .env pull app
+            docker compose --env-file .env up -d
+            docker image prune -f
+
+      - name: Teste de fumaça (staging)
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS "${{ vars.STAGING_URL }}/actuator/health" | grep -q '"status":"UP"'; then
+              echo "Aplicação saudável"; exit 0
+            fi
+            echo "Aguardando aplicação subir ($i/12)..."; sleep 5
+          done
+          echo "Aplicação não respondeu a tempo"; exit 1
+
+  deploy-production:
+    name: Deploy em produção
+    needs: [docker-image, deploy-staging]
+    runs-on: ubuntu-latest
+    # Configure "Required reviewers" no environment production para exigir aprovação manual
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copiar compose para o servidor
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: docker-compose.yml
+          target: ~/cuidaidoso/production
+
+      - name: Subir nova versão
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ~/cuidaidoso/production
+            export APP_IMAGE=${{ needs.docker-image.outputs.image }}
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose --env-file .env pull app
+            docker compose --env-file .env up -d
+            docker image prune -f
+
+      - name: Teste de fumaça (produção)
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS "${{ vars.PRODUCTION_URL }}/actuator/health" | grep -q '"status":"UP"'; then
+              echo "Aplicação saudável"; exit 0
+            fi
+            echo "Aguardando aplicação subir ($i/12)..."; sleep 5
+          done
+          echo "Aplicação não respondeu a tempo"; exit 1
